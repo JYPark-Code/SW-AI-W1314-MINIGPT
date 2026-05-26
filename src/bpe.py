@@ -20,6 +20,33 @@ SPECIAL_IDS = {token: idx for idx, token in enumerate(SPECIAL_TOKENS)}
 BYTE_OFFSET = len(SPECIAL_TOKENS)
 NUM_BYTES = 256
 
+def get_pair_counts(ids):
+    """이웃한 token pair의 빈도를 센다.
+
+        Args:
+            ids: token ID 리스트
+        Returns:
+            {(a, b): 빈도} 형태의 dict
+    """
+    counts = {}
+    for i in range(len(ids) - 1):
+        pair = (ids[i], ids[i + 1])
+        counts[pair] = counts.get(pair, 0) + 1
+    return counts
+
+def merge_pair(ids, pair, new_id):
+    result = []
+    i = 0
+    while i < len(ids):
+        if i < len(ids) - 1 and ids[i] == pair[0] and ids[i + 1] == pair[1]:
+            # 같은 경우
+            result.append(new_id)  # 새 ID 하나 넣고
+            i += 2  # 두 칸 점프
+        else:
+            # 아닌 경우
+            result.append(ids[i])  # 지금 원소 그대로 넣고
+            i += 1  # 한 칸
+    return result
 
 class BPETokenizer:
     """
@@ -83,7 +110,23 @@ class BPETokenizer:
         - 새 token ID를 만들고, 시퀀스의 해당 pair를 새 ID로 치환합니다.
         - `self.merges`, `self.id_to_token`, `self.token_to_id`를 갱신합니다.
         """
-        raise NotImplementedError("BPETokenizer.train을 구현하세요.")
+        self._init_special_tokens()
+        ids = [ b + BYTE_OFFSET for b in corpus.encode("utf-8")] # 1단계
+        next_id = BYTE_OFFSET + NUM_BYTES                        # 260
+
+        while len(self.id_to_token) < self.vocab_size:  # 4단계: 목표까지 반복
+            counts = get_pair_counts(ids)  # 2단계: 빈도 세기
+            if not counts:  # pair가 없으면 멈춤
+                break
+            best_pair = max(counts, key=counts.get)  # 3-(a): 최다 pair
+            # 3-(b): ids에서 best_pair를 next_id로 치환
+            ids = merge_pair(ids, best_pair, next_id)
+            # self.merges, id_to_token, token_to_id 갱신
+            self.merges.append(best_pair)  # 학습 순서 기록: [(11,12), ...]
+            self.id_to_token[next_id] = best_pair  # 260 → (11,12)
+            self.token_to_id[best_pair] = next_id  # (11,12) → 260
+            next_id += 1
+
 
     def save(self, path: str | Path):
         """
