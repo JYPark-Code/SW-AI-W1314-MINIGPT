@@ -28,14 +28,22 @@ def get_pair_counts(ids):
             ids: token ID 리스트
         Returns:
             {(a, b): 빈도} 형태의 dict
+
+        예: [10, 11, 12, 11, 12] → {(10,11):1, (11,12):2, (12,11):1}
     """
     counts = {}
     for i in range(len(ids) - 1):
         pair = (ids[i], ids[i + 1])
+        # dict.get(key, default): 키가 없으면 default 반환. defaultdict 대안.
         counts[pair] = counts.get(pair, 0) + 1
     return counts
 
 def merge_pair(ids, pair, new_id):
+    """ids에 등장하는 pair를 모두 new_id 하나로 치환.
+
+    겹침 방지를 위해 left-to-right로 훑으며 매칭 시 2칸 점프하는 방식.
+    예: ids=[1,2,1,2,2], pair=(1,2), new_id=99 → [99, 99, 2]
+    """
     result = []
     i = 0
     while i < len(ids):
@@ -67,9 +75,12 @@ class BPETokenizer:
 
     def _init_special_tokens(self):
         """
-        TODO:
-        1. 특수 토큰 4개를 고정 ID 0~3에 등록합니다.
-        2. byte 0~255를 ID 4~259에 bytes([byte_value]) 형태로 등록합니다.
+        기본 사전 초기화:
+        1. 특수 토큰 4개를 고정 ID 0~3에 등록.
+        2. byte 0~255를 ID 4~259에 bytes([byte_value]) 형태로 등록.
+
+        bytes([v])는 길이 1짜리 bytes 객체. str과 달리 dict key로 쓸 수 있고
+        byte-level BPE에선 임의의 유니코드(특히 한글)도 깨짐 없이 다룰 수 있어 안전함.
         """
         special_token = ["<pad>", "<unk>", "<bos>", "<eos>"]
         for i in range(4):
@@ -103,15 +114,20 @@ class BPETokenizer:
 
     def train(self, corpus: str):
         """
-        TODO: 코퍼스에서 BPE merge rule과 vocabulary를 학습합니다.
+        코퍼스에서 BPE merge rule과 vocabulary를 학습합니다.
 
-        구현 힌트:
-        - `corpus.encode("utf-8")`로 byte ID 시퀀스를 만듭니다.
-        - 가장 자주 등장하는 이웃 token pair를 찾습니다.
-        - 새 token ID를 만들고, 시퀀스의 해당 pair를 새 ID로 치환합니다.
-        - `self.merges`, `self.id_to_token`, `self.token_to_id`를 갱신합니다.
+        알고리즘:
+        1) UTF-8 byte 시퀀스로 변환 → 각 byte를 +4 offset 줘서 special token ID와 겹치지 않게.
+        2) 가장 자주 등장하는 (a, b) 쌍을 찾음.
+        3) 새 ID로 치환하고, merges/사전 업데이트.
+        4) vocab_size에 도달하거나 더 합칠 pair가 없을 때까지 반복.
+
+        merges는 학습된 순서대로 저장됨 — encode 시 이 순서를 그대로 적용해야
+        같은 token화 결과가 나옴 (순서 바뀌면 다른 segmentation이 됨).
         """
         self._init_special_tokens()
+        # corpus.encode("utf-8") → bytes 객체 (정수 시퀀스처럼 iterate 가능, 각 원소 0~255)
+        # +BYTE_OFFSET(=4): special token과 충돌 안 나도록 byte 0 → ID 4부터 시작
         ids = [ b + BYTE_OFFSET for b in corpus.encode("utf-8")] # 1단계
         next_id = BYTE_OFFSET + NUM_BYTES                        # 260
 
@@ -119,6 +135,7 @@ class BPETokenizer:
             counts = get_pair_counts(ids)  # 2단계: 빈도 세기
             if not counts:  # pair가 없으면 멈춤
                 break
+            # max(dict, key=dict.get): value가 최대인 key 반환. 동률이면 먼저 나온 것.
             best_pair = max(counts, key=counts.get)  # 3-(a): 최다 pair
             # 3-(b): ids에서 best_pair를 next_id로 치환
             ids = merge_pair(ids, best_pair, next_id)
@@ -131,22 +148,26 @@ class BPETokenizer:
 
     def save(self, path: str | Path):
         """
-        TODO: vocabulary와 merge rule을 JSON 파일로 저장합니다.
+        vocabulary와 merge rule을 JSON 파일로 저장합니다.
 
-        bytes와 tuple은 JSON에 바로 저장할 수 없으므로 type 정보를 함께 저장하세요.
+        merges만 저장해도 충분한 이유:
+        - special 토큰(0~3)과 byte 토큰(4~259)은 _init_special_tokens()으로 재구성 가능.
+        - merges 순서만 그대로면 id_to_token/token_to_id를 완전히 복원할 수 있음.
+        JSON 제약: tuple은 list로, bytes는 표현 불가 → 여기선 merge가 (int,int) 튜플이라
+        list 변환만으로 충분.
         """
         data = {
             "vocab_size" : self.vocab_size,
             "merges" : [list(pair) for pair in self.merges],
         }
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False) # 한글을 그대로 저장하기 위해서 False
+            # ensure_ascii=False: 기본값(True)은 비ASCII를 \uXXXX로 이스케이프함.
+            # 여기선 merges가 int뿐이라 사실상 영향 없지만, 한글 보존 관례로 False.
+            json.dump(data, f, ensure_ascii=False)
 
 
     def load(self, path: str | Path):
-        """
-        TODO: save()로 저장한 JSON 파일을 읽어 vocabulary와 merge rule을 복원합니다.
-        """
+        """save()로 저장한 JSON 파일을 읽어 사전을 완전히 복원합니다."""
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
@@ -156,6 +177,7 @@ class BPETokenizer:
 
         next_id = BYTE_OFFSET + NUM_BYTES  # 260부터
         for pair_list in data["merges"]:
+            # JSON에선 tuple→list로 직렬화됐으므로 다시 tuple로 (dict key로 쓰려면 hashable 필요)
             pair = tuple(pair_list)  # [36,240] → (36,240)
             self.merges.append(pair)
             self.id_to_token[next_id] = pair
@@ -165,12 +187,10 @@ class BPETokenizer:
 
     def encode(self, text: str, add_bos_eos: bool = False) -> list[int]:
         """
-        TODO: 문자열을 token ID 리스트로 변환합니다.
+        문자열 → token ID 리스트.
 
-        구현 힌트:
-        - 먼저 UTF-8 byte ID 리스트를 만듭니다.
-        - train/load에서 얻은 merge rule을 학습 순서대로 적용합니다.
-        - add_bos_eos=True이면 앞뒤에 bos/eos ID를 붙입니다.
+        핵심: train에서 학습한 merges를 학습된 순서대로 그대로 적용해야 함.
+        순서가 달라지면 greedy하게 합쳐지는 모양이 달라져 다른 segmentation이 나옴.
         """
         ids = [b + BYTE_OFFSET for b in text.encode("utf-8")]   #1
         for pair in self.merges:                                #2
@@ -183,11 +203,11 @@ class BPETokenizer:
 
     def decode(self, ids: list[int], skip_special: bool = True) -> str:
         """
-        TODO: token ID 리스트를 문자열로 복원합니다.
+        token ID 리스트 → 문자열 복원.
 
-        주의:
-        - merge token은 원본 byte token까지 재귀적으로 펼칩니다.
-        - byte를 하나씩 decode하지 말고, 마지막에 `bytes(...).decode("utf-8")`를 한 번만 호출합니다.
+        merge로 만든 토큰은 (a, b) 쌍을 다시 a와 b로 재귀 분해해서 최종적으론
+        byte 시퀀스까지 풀어낸 뒤, 한 번에 UTF-8 디코딩.
+        byte별로 따로 decode하면 멀티바이트 글자(한글 등)가 깨짐.
         """
         def expand(x):
             if x < BYTE_OFFSET:
@@ -201,5 +221,7 @@ class BPETokenizer:
         all_bytes = []
         for x in ids:
             all_bytes += expand(x)
+        # ID → 원본 byte값(0~255)로 되돌리기
         raw_bytes = [v - BYTE_OFFSET for v in all_bytes]
+        # bytes(int_list).decode("utf-8"): 정수 리스트를 bytes로 만들고 한 번에 UTF-8 해석
         return bytes(raw_bytes).decode("utf-8")
